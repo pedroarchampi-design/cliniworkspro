@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useLocation } from "wouter";
-import { Check, Stethoscope, Heart, Eye, Users, Brain, Baby, Flower2, Smile, ArrowRight } from "lucide-react";
+import { Check, Stethoscope, Heart, Eye, Users, Brain, Baby, Flower2, Smile, ArrowRight, Siren, Bone } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/use-auth";
 import { useLanguage } from "@/hooks/use-language";
@@ -9,11 +9,14 @@ import { t, tNested, type Lang } from "@/lib/i18n";
 const SPECIALTIES = [
   { id: "Obstetrics", icon: Baby, color: "text-pink-400", bg: "bg-pink-500/10", border: "border-pink-500/20" },
   { id: "Gynecology", icon: Flower2, color: "text-rose-400", bg: "bg-rose-500/10", border: "border-rose-500/20" },
+  { id: "Emergency", icon: Siren, color: "text-orange-400", bg: "bg-orange-500/10", border: "border-orange-500/20" },
   { id: "Pediatrics", icon: Smile, color: "text-amber-400", bg: "bg-amber-500/10", border: "border-amber-500/20" },
   { id: "Cardiology", icon: Heart, color: "text-red-400", bg: "bg-red-500/10", border: "border-red-500/20" },
   { id: "Sonography", icon: Eye, color: "text-blue-400", bg: "bg-blue-500/10", border: "border-blue-500/20" },
   { id: "General Practice", icon: Users, color: "text-emerald-400", bg: "bg-emerald-500/10", border: "border-emerald-500/20" },
   { id: "Neurology", icon: Brain, color: "text-purple-400", bg: "bg-purple-500/10", border: "border-purple-500/20" },
+  { id: "Dermatology", icon: Stethoscope, color: "text-cyan-400", bg: "bg-cyan-500/10", border: "border-cyan-500/20" },
+  { id: "Orthopedics", icon: Bone, color: "text-slate-400", bg: "bg-slate-500/10", border: "border-slate-500/20" },
   { id: "Other", icon: Stethoscope, color: "text-teal-400", bg: "bg-teal-500/10", border: "border-teal-500/20" },
 ];
 
@@ -22,19 +25,19 @@ type PlanId = "free" | "gold" | "diamond";
 const PLAN_PRICES: Record<PlanId, string> = { free: "$0", gold: "$20/mo", diamond: "$50/mo" };
 
 const PLAN_ANALYSES: Record<PlanId, Record<Lang, string>> = {
-  free:    { pt: "5 análises/mês", en: "5 analyses/month", es: "5 análisis/mes" },
-  gold:    { pt: "100 análises/mês", en: "100 analyses/month", es: "100 análisis/mes" },
+  free:    { pt: "5 analises/mes", en: "5 analyses/month", es: "5 analisis/mes" },
+  gold:    { pt: "100 analises/mes", en: "100 analyses/month", es: "100 analisis/mes" },
   diamond: { pt: "Ilimitado", en: "Unlimited", es: "Ilimitado" },
 };
 
 const PLAN_DESCS: Record<PlanId, Record<Lang, string>> = {
   free:    { pt: "Experimente o DeltaScan sem custo.", en: "Try DeltaScan at no cost.", es: "Pruebe DeltaScan sin costo." },
-  gold:    { pt: "Para médicos independentes.", en: "For independent physicians.", es: "Para médicos independientes." },
-  diamond: { pt: "Clínicas e uso intensivo.", en: "Clinics & intensive use.", es: "Clínicas y uso intensivo." },
+  gold:    { pt: "Para medicos independentes.", en: "For independent physicians.", es: "Para medicos independientes." },
+  diamond: { pt: "Clinicas e uso intensivo.", en: "Clinics & intensive use.", es: "Clinicas y uso intensivo." },
 };
 
 const PLAN_LABELS: Record<PlanId, Record<Lang, string>> = {
-  free:    { pt: "Grátis", en: "Free", es: "Gratis" },
+  free:    { pt: "Gratis", en: "Free", es: "Gratis" },
   gold:    { pt: "Gold", en: "Gold", es: "Gold" },
   diamond: { pt: "Diamond", en: "Diamond", es: "Diamond" },
 };

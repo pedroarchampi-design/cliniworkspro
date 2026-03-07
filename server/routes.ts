@@ -10,7 +10,11 @@ import OpenAI, { toFile } from "openai";
 // ══════════════════════════════════════════════════════════════════
 
 const REAL_API = process.env.REAL_API_URL || "https://deltascan-api-pxtie6c4zq-uc.a.run.app";
-const GOOGLE_TOKEN = process.env.GOOGLE_API_KEY || "";
+const GOOGLE_TOKEN = process.env.VERTEX_TOKEN || process.env.GOOGLE_API_KEY || "";
+const GCP_PROJECT = process.env.GCP_PROJECT || "supernova-2026";
+const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_PRICE_GOLD = process.env.STRIPE_PRICE_GOLD || "";
+const STRIPE_PRICE_DIAMOND = process.env.STRIPE_PRICE_DIAMOND || "";
 
 const MAX_AUDIO_BASE64_LENGTH = 20_000_000; // ~15MB decoded
 const MAX_IMAGE_BASE64_LENGTH = 15_000_000; // ~11MB decoded
@@ -45,6 +49,10 @@ const grok = XAI_KEY ? new OpenAI({
   baseURL: "https://api.x.ai/v1",
 }) : null;
 
+// ── Stripe ────────────────────────────────────────────────────────
+import Stripe from "stripe";
+const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET, { apiVersion: "2025-01-27.acacia" as any }) : null;
+
 // ══════════════════════════════════════════════════════════════════
 // AI PIPELINE FUNCTIONS
 // ══════════════════════════════════════════════════════════════════
@@ -60,41 +68,67 @@ interface PipelineLog {
 }
 
 /**
- * Pipeline 1: Whisper STT — Voice Transcription
- * Primary: OpenAI whisper-1
+ * Pipeline 1: STT — Voice Transcription
+ * Primary: Vertex Health (Google Speech-to-Text Medical) | Fallback: OpenAI Whisper
  */
 async function pipelineWhisperSTT(audioBase64: string): Promise<{ text: string; log: PipelineLog }> {
   const start = Date.now();
-  try {
-    const audioRaw = audioBase64.includes(",")
-      ? audioBase64.split(",")[1]
-      : audioBase64;
-    const audioMime = audioBase64.startsWith("data:")
-      ? audioBase64.split(";")[0].split(":")[1]
-      : "audio/webm";
-    const ext = audioMime.split("/")[1]?.replace("mpeg", "mp3") || "webm";
+  const audioRaw = audioBase64.includes(",") ? audioBase64.split(",")[1] : audioBase64;
+  const audioMime = audioBase64.startsWith("data:") ? audioBase64.split(";")[0].split(":")[1] : "audio/webm";
+  const ext = audioMime.split("/")[1]?.replace("mpeg", "mp3") || "webm";
 
-    const audioBuffer = Buffer.from(audioRaw, "base64");
-    const file = await toFile(audioBuffer, `audio.${ext}`, { type: audioMime });
-
-    const resp = await openai.audio.transcriptions.create({
-      file,
-      model: "whisper-1",
-      language: "pt",
-    });
-
-    console.log("[Pipeline 1 - Whisper STT] OK: length =", resp.text.length);
-    return {
-      text: resp.text,
-      log: { step: "whisper_stt", provider: "openai", status: "success", durationMs: Date.now() - start },
-    };
-  } catch (e: any) {
-    console.error("[Pipeline 1 - Whisper STT] Error:", e.message);
-    return {
-      text: "",
-      log: { step: "whisper_stt", provider: "openai", status: "error", durationMs: Date.now() - start, error: e.message },
-    };
+  // ── Try Vertex Health (Google Speech-to-Text Medical) ──────────────
+  if (GOOGLE_TOKEN) {
+    try {
+      const encoding = audioMime.includes("webm") ? "WEBM_OPUS" :
+                       audioMime.includes("ogg") ? "OGG_OPUS" :
+                       audioMime.includes("mp4") ? "MP4" : "LINEAR16";
+      const resp = await fetch("https://speech.googleapis.com/v1/speech:recognize", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${GOOGLE_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          config: {
+            encoding,
+            sampleRateHertz: 16000,
+            languageCode: "pt-BR",
+            alternativeLanguageCodes: ["en-US", "es-ES"],
+            enableAutomaticPunctuation: true,
+            model: "medical_dictation",
+            useEnhanced: true,
+          },
+          audio: { content: audioRaw },
+        }),
+      });
+      if (resp.ok) {
+        const data = await resp.json() as any;
+        const transcript = (data.results || []).map((r: any) => r.alternatives?.[0]?.transcript || "").join(" ").trim();
+        if (transcript) {
+          console.log("[Pipeline 1 - Vertex Health STT] OK: length =", transcript.length);
+          return { text: transcript, log: { step: "whisper_stt", provider: "openai", status: "success", durationMs: Date.now() - start } };
+        }
+      } else {
+        const errText = await resp.text();
+        console.warn("[Pipeline 1 - Vertex Health STT] Failed:", resp.status, errText.slice(0, 150));
+      }
+    } catch (e: any) {
+      console.warn("[Pipeline 1 - Vertex Health STT] Error:", e.message);
+    }
   }
+
+  // ── Fallback: OpenAI Whisper ──────────────────────────────────────
+  if (OPENAI_KEY) {
+    try {
+      const audioBuffer = Buffer.from(audioRaw, "base64");
+      const file = await toFile(audioBuffer, `audio.${ext}`, { type: audioMime });
+      const resp = await openai.audio.transcriptions.create({ file, model: "whisper-1", language: "pt" });
+      console.log("[Pipeline 1 - Whisper STT] OK: length =", resp.text.length);
+      return { text: resp.text, log: { step: "whisper_stt", provider: "openai", status: "success", durationMs: Date.now() - start } };
+    } catch (e: any) {
+      console.error("[Pipeline 1 - Whisper STT] Error:", e.message);
+    }
+  }
+
+  return { text: "", log: { step: "whisper_stt", provider: "openai", status: "error", durationMs: Date.now() - start, error: "All STT providers failed" } };
 }
 
 /**
@@ -183,8 +217,8 @@ Responda APENAS em JSON válido (sem markdown, sem texto extra):
 }
 
 /**
- * Pipeline 3: Image Analysis — GPT-4o Vision
- * Primary: OpenAI GPT-4o Vision | Fallback: Grok Vision
+ * Pipeline 3: Image Analysis
+ * Primary: Vertex Vision (Gemini 1.5 Pro) | Fallback: GPT-4o Vision | Fallback: Grok Vision
  */
 async function pipelineImageAnalysis(
   imageBase64: string,
@@ -192,12 +226,8 @@ async function pipelineImageAnalysis(
 ): Promise<{ impression: string; log: PipelineLog }> {
   const start = Date.now();
 
-  const imageRaw = imageBase64.includes(",")
-    ? imageBase64.split(",")[1]
-    : imageBase64;
-  const imageMime = imageBase64.startsWith("data:")
-    ? imageBase64.split(";")[0].split(":")[1]
-    : "image/jpeg";
+  const imageRaw = imageBase64.includes(",") ? imageBase64.split(",")[1] : imageBase64;
+  const imageMime = imageBase64.startsWith("data:") ? imageBase64.split(";")[0].split(":")[1] : "image/jpeg";
 
   const visionPrompt = `Você é um especialista em radiologia e medicina de imagem com 20 anos de experiência clínica.
 
@@ -213,6 +243,40 @@ Estruture sua análise em:
 
 IMPORTANTE: Esta é uma impressão técnica para o médico, NÃO um diagnóstico final para o paciente.`;
 
+  // ── Try Vertex Vision (Gemini 1.5 Pro) ──────────────────────────────
+  if (GOOGLE_TOKEN) {
+    try {
+      const resp = await fetch(
+        `https://us-central1-aiplatform.googleapis.com/v1/projects/${GCP_PROJECT}/locations/us-central1/publishers/google/models/gemini-1.5-pro:generateContent`,
+        {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${GOOGLE_TOKEN}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [
+              { text: visionPrompt },
+              { inlineData: { mimeType: imageMime, data: imageRaw } },
+            ]}],
+            generationConfig: { temperature: 0.2, maxOutputTokens: 2048 },
+          }),
+        }
+      );
+      if (resp.ok) {
+        const data = await resp.json() as any;
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) {
+          console.log("[Pipeline 3 - Vertex Vision] OK");
+          return { impression: text, log: { step: "image_analysis", provider: "openai", status: "success", durationMs: Date.now() - start } };
+        }
+      } else {
+        const errText = await resp.text();
+        console.warn("[Pipeline 3 - Vertex Vision] Failed:", resp.status, errText.slice(0, 150));
+      }
+    } catch (e: any) {
+      console.warn("[Pipeline 3 - Vertex Vision] Error:", e.message);
+    }
+  }
+
+  // ── Fallback: OpenAI GPT-4o Vision + Grok Vision ─────────────────
   const providers: { name: AIProvider; client: OpenAI; model: string }[] = [
     { name: "openai", client: openai, model: "gpt-4o" },
     ...(grok ? [{ name: "grok" as AIProvider, client: grok, model: "grok-2-vision-1212" }] : []),
@@ -232,23 +296,17 @@ IMPORTANTE: Esta é uma impressão técnica para o médico, NÃO um diagnóstico
         temperature: 0.2,
         max_tokens: 2048,
       });
-
       const text = resp.choices[0]?.message?.content;
       if (!text) throw new Error("Empty vision response");
-
       console.log(`[Pipeline 3 - Image Analysis] OK via ${name}`);
-      return {
-        impression: text,
-        log: { step: "image_analysis", provider: name, status: "success", durationMs: Date.now() - start },
-      };
+      return { impression: text, log: { step: "image_analysis", provider: name, status: "success", durationMs: Date.now() - start } };
     } catch (e: any) {
       console.warn(`[Pipeline 3 - Image Analysis] ${name} failed:`, e.message);
-      continue;
     }
   }
 
   return {
-    impression: "Análise de imagem não disponível. Verifique as chaves de API.",
+    impression: "Análise de imagem não disponível. Configure VERTEX_TOKEN, OPENAI_API_KEY ou XAI_API_KEY.",
     log: { step: "image_analysis", provider: "openai", status: "error", durationMs: Date.now() - start, error: "All providers failed" },
   };
 }
@@ -517,26 +575,59 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     res.json(consultation);
   });
 
-  // ── Subscription checkout ───────────────────────────────────────
+  // ── Subscription checkout (Stripe real) ───────────────────────────
   app.post(api.subscription.checkout.path, async (req, res) => {
     try {
       const input = api.subscription.checkout.input.parse(req.body);
+
+      // Use real Stripe if configured
+      if (stripe) {
+        const PRICE_IDS: Record<string, string> = {
+          gold: STRIPE_PRICE_GOLD || "price_gold",
+          diamond: STRIPE_PRICE_DIAMOND || "price_diamond",
+        };
+        const priceId = PRICE_IDS[input.plan];
+        if (priceId && priceId !== "price_gold" && priceId !== "price_diamond") {
+          try {
+            const session = await stripe.checkout.sessions.create({
+              mode: "subscription",
+              payment_method_types: ["card"],
+              line_items: [{ price: priceId, quantity: 1 }],
+              success_url: `${req.headers.origin || "https://deltascan.app"}/settings?success=true&plan=${input.plan}`,
+              cancel_url: `${req.headers.origin || "https://deltascan.app"}/upgrade?canceled=true`,
+              metadata: { doctorId: input.doctorId || "", plan: input.plan },
+              allow_promotion_codes: true,
+            });
+            return res.json({ checkout_url: session.url });
+          } catch (stripeErr: any) {
+            console.error("[Stripe] Checkout error:", stripeErr.message);
+          }
+        }
+      }
+
+      // Fallback: try Cloud Run API
       try {
         const checkoutResp = await fetch(`${REAL_API}/api/create-checkout-session`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${GOOGLE_TOKEN}` },
-          body: JSON.stringify({ user_id: input.doctorId, email: `${input.doctorId}@deltascan.app` }),
+          body: JSON.stringify({ user_id: input.doctorId, plan: input.plan, email: `${input.doctorId}@deltascan.app` }),
         });
         if (checkoutResp.ok) {
           const data = await checkoutResp.json() as any;
-          if (data.url) return res.json({ checkout_url: data.url });
+          if (data.url || data.checkout_url) return res.json({ checkout_url: data.url || data.checkout_url });
         }
       } catch {}
+
       res.json({ checkout_url: `/settings?plan=${input.plan}&demo=true` });
     } catch (err) {
       if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
       throw err;
     }
+  });
+
+  // ── AI Status (updated with Vertex) ────────────────────────────────
+  app.get("/api/health", (_req, res) => {
+    res.json({ status: "ok", service: "DeltaScan API", version: "2.0.0", timestamp: new Date().toISOString() });
   });
 
   return httpServer;

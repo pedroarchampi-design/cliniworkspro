@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useLocation } from "wouter";
-import { Brain, Shield, DollarSign, Stethoscope, Globe, ChevronDown, Mic, Image, FileText, Sparkles } from "lucide-react";
+import { Brain, Shield, DollarSign, Stethoscope, Globe, ChevronDown, Mic, Image, FileText, Sparkles, Activity, Zap, Lock } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -42,10 +42,10 @@ export default function Landing() {
   ];
 
   const pipelines = [
-    { icon: Mic, label: "Whisper STT", desc: "Transcrição de voz", color: "from-teal-500 to-teal-600" },
-    { icon: Brain, label: "GPT-4o Clinical", desc: "Análise clínica com IA", color: "from-blue-500 to-blue-600" },
-    { icon: Image, label: "GPT-4o Vision", desc: "Análise de imagens", color: "from-purple-500 to-purple-600" },
-    { icon: FileText, label: "Patient Education", desc: "Material educativo", color: "from-emerald-500 to-emerald-600" },
+    { icon: Mic, label: t("landing", "pipeline1", lang), desc: t("landing", "pipeline1Desc", lang), color: "from-teal-500 to-teal-600" },
+    { icon: Brain, label: t("landing", "pipeline2", lang), desc: t("landing", "pipeline2Desc", lang), color: "from-blue-500 to-blue-600" },
+    { icon: Image, label: t("landing", "pipeline3", lang), desc: t("landing", "pipeline3Desc", lang), color: "from-purple-500 to-purple-600" },
+    { icon: FileText, label: t("landing", "pipeline4", lang), desc: t("landing", "pipeline4Desc", lang), color: "from-emerald-500 to-emerald-600" },
   ];
 
   return (
@@ -123,7 +123,7 @@ export default function Landing() {
           className="bg-gradient-to-r from-teal-500 to-teal-400 hover:from-teal-400 hover:to-teal-300 text-slate-900 font-bold text-base h-14 px-10 rounded-2xl shadow-xl shadow-teal-500/30 hover:shadow-teal-400/40 transition-all hover:-translate-y-1 hover:scale-105"
           data-testid="button-cta"
         >
-          {t("landing", "signinGoogle", lang)}
+          {t("landing", "startFree", lang)}
         </Button>
 
         {/* 4 AI Pipelines showcase */}
@@ -162,9 +162,9 @@ export default function Landing() {
 
         {/* Trust indicators */}
         <div className="flex flex-wrap items-center justify-center gap-6 mt-16 text-slate-500 text-xs">
-          <span className="flex items-center gap-1.5"><Shield className="w-3.5 h-3.5 text-teal-500" /> LGPD Compliant</span>
-          <span className="flex items-center gap-1.5"><Brain className="w-3.5 h-3.5 text-blue-500" /> GPT-4o + Whisper</span>
-          <span className="flex items-center gap-1.5"><Sparkles className="w-3.5 h-3.5 text-purple-500" /> Multi-Provider AI</span>
+          <span className="flex items-center gap-1.5"><Lock className="w-3.5 h-3.5 text-teal-500" /> LGPD / HIPAA</span>
+          <span className="flex items-center gap-1.5"><Zap className="w-3.5 h-3.5 text-blue-500" /> DeltaScan AI Engine</span>
+          <span className="flex items-center gap-1.5"><Activity className="w-3.5 h-3.5 text-purple-500" /> Multi-Pipeline Architecture</span>
         </div>
       </main>
 

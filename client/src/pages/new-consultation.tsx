@@ -1,11 +1,10 @@
 import { useState, useRef } from "react";
-import { Mic, Square, Upload, X, CheckCircle2, AlertCircle, FileText, Activity, BrainCircuit, Zap, Check, FlaskConical } from "lucide-react";
+import { Mic, Square, Upload, X, CheckCircle2, AlertCircle, FileText, Activity, BrainCircuit, Zap, Check, FlaskConical, Download, Copy } from "lucide-react";
 import { useAudioRecorder } from "@/hooks/use-audio-recorder";
 import { useCreateConsultation } from "@/hooks/use-consultations";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
@@ -14,31 +13,32 @@ import { useAuth } from "@/hooks/use-auth";
 import { useLanguage } from "@/hooks/use-language";
 import { t, tNested } from "@/lib/i18n";
 
-const SPECIALTIES = [
-  "General Practice", "Cardiology", "Neurology", "Obstetrics",
-  "Pediatrics", "Sonography", "Dermatology", "Orthopedics"
-];
-
 export default function NewConsultation() {
   const { toast } = useToast();
   const { auth, incrementUsage } = useAuth();
   const { lang } = useLanguage();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [specialty, setSpecialty] = useState<string>(auth.doctorSpecialty || "General Practice");
+  // Use specialty from onboarding — no selector needed
+  const specialty = auth.doctorSpecialty || "General Practice";
+
   const [notes, setNotes] = useState("");
   const [imageBase64, setImageBase64] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState("overview");
 
   const { isRecording, recordingTime, audioBase64, startRecording, stopRecording, clearAudio } = useAudioRecorder();
   const createConsultation = useCreateConsultation();
-  const { data: aiStatus } = useQuery<{ openai: boolean; anyAI: boolean; whisper: boolean; imageAnalysis: boolean }>({
+  const { data: aiStatus } = useQuery<{ anyAI: boolean; whisper: boolean; imageAnalysis: boolean; pipelines: Record<string, { available: boolean }> }>({
     queryKey: ["/api/ai-status"],
   });
 
   const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      toast({ title: "Imagem muito grande", description: "Máximo 10MB", variant: "destructive" });
+      return;
+    }
     const reader = new FileReader();
     reader.onloadend = () => setImageBase64(reader.result as string);
     reader.readAsDataURL(file);
@@ -64,8 +64,64 @@ export default function NewConsultation() {
         incrementUsage();
         toast({ title: t("dashboard", "analysisComplete", lang), description: t("dashboard", "resultsReady", lang) });
         setActiveTab("overview");
+      },
+      onError: (err: any) => {
+        toast({ title: "Erro na análise", description: err?.message || "Tente novamente.", variant: "destructive" });
       }
     });
+  };
+
+  const handleExportPdf = () => {
+    if (!result) return;
+    const content = [
+      `DeltaScan — Relatório de Consulta`,
+      `Médico: ${auth.doctorName}`,
+      `Especialidade: ${tNested("dashboard", "specialties", specialty, lang) || specialty}`,
+      `Data: ${new Date().toLocaleDateString("pt-BR")}`,
+      ``,
+      `=== TRANSCRIÇÃO ===`,
+      result.transcription || "—",
+      ``,
+      `=== HIPÓTESES DIAGNÓSTICAS ===`,
+      ...(Array.isArray(result.hypotheses) ? (result.hypotheses as any[]).map((h: any, i: number) =>
+        `${i + 1}. ${h.condition} (${h.probability?.toUpperCase()}) ${h.icd10 ? `[${h.icd10}]` : ""}\n   ${h.reasoning}`
+      ) : ["—"]),
+      ``,
+      `=== IMPRESSÃO DE IMAGEM ===`,
+      result.imageImpression || "Nenhuma imagem enviada.",
+      ``,
+      `=== PLANO DE CUIDADO ===`,
+      `Ações Imediatas: ${Array.isArray((result.carePlan as any)?.immediate_actions) ? (result.carePlan as any).immediate_actions.join("; ") : "—"}`,
+      `Exames: ${(result.carePlan as any)?.exams || "—"}`,
+      `Prescrição: ${(result.carePlan as any)?.prescription || "—"}`,
+      `Seguimento: ${(result.carePlan as any)?.follow_up || "—"}`,
+      ``,
+      `=== EDUCAÇÃO DO PACIENTE ===`,
+      (result.patientMaterials as any)?.simple_explanation || "—",
+      ``,
+      `---`,
+      `Ferramenta educacional de apoio à decisão. O médico mantém a responsabilidade clínica.`,
+    ].join("\n");
+
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `deltascan-consulta-${new Date().toISOString().slice(0, 10)}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast({ title: t("dashboard", "exportPdf", lang), description: "Relatório exportado com sucesso." });
+  };
+
+  const handleCopyReport = () => {
+    if (!result) return;
+    const text = [
+      result.transcription,
+      ...(Array.isArray(result.hypotheses) ? (result.hypotheses as any[]).map((h: any) => `• ${h.condition} (${h.probability})`) : []),
+      result.imageImpression,
+    ].filter(Boolean).join("\n\n");
+    navigator.clipboard.writeText(text);
+    toast({ title: "Copiado!", description: "Relatório copiado para a área de transferência." });
   };
 
   const result = createConsultation.data?.data;
@@ -95,30 +151,17 @@ export default function NewConsultation() {
                 <Activity className="w-5 h-5 text-primary" />
                 {t("dashboard", "pageTitle", lang)}
               </CardTitle>
+              {/* Specialty badge — read-only from onboarding */}
+              <div className="flex items-center gap-2 mt-1">
+                <Badge variant="outline" className="text-xs text-primary border-primary/30 bg-primary/5">
+                  {tNested("dashboard", "specialties", specialty, lang) || specialty}
+                </Badge>
+              </div>
             </CardHeader>
             <CardContent className="p-5 space-y-5">
 
-              {/* Specialty */}
-              <div className="space-y-2">
-                <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  {t("dashboard", "specialty", lang)}
-                </label>
-                <Select value={specialty} onValueChange={setSpecialty}>
-                  <SelectTrigger className="h-11 rounded-xl" data-testid="select-specialty">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {SPECIALTIES.map(s => (
-                      <SelectItem key={s} value={s}>
-                        {tNested("dashboard", "specialties", s, lang) || s}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
               {/* Voice Recording */}
-              <div className="space-y-3 pt-3 border-t border-border/50">
+              <div className="space-y-3">
                 <label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground block">
                   {t("dashboard", "voiceRecording", lang)}
                 </label>
@@ -216,7 +259,8 @@ export default function NewConsultation() {
               >
                 {createConsultation.isPending ? (
                   <span className="flex items-center gap-2">
-                    <Zap className="w-4 h-4 animate-pulse" /> {t("dashboard", "analyzingBtn", lang)}
+                    <Zap className="w-4 h-4 animate-pulse" />
+                    {t("dashboard", "analyzingBtn", lang)}
                   </span>
                 ) : isAtLimit ? t("dashboard", "limitReached", lang) : t("dashboard", "analyzeBtn", lang)}
               </Button>
@@ -237,6 +281,20 @@ export default function NewConsultation() {
               <p className="text-muted-foreground text-center max-w-sm text-sm">
                 {t("dashboard", "analyzingDesc", lang)}
               </p>
+              {/* Pipeline progress indicators */}
+              <div className="mt-6 grid grid-cols-4 gap-2 w-full max-w-xs">
+                {[
+                  { label: "Voz", color: "bg-teal-500" },
+                  { label: "Análise", color: "bg-blue-500" },
+                  { label: "Imagem", color: "bg-purple-500" },
+                  { label: "Educação", color: "bg-emerald-500" },
+                ].map((p, i) => (
+                  <div key={p.label} className="text-center">
+                    <div className={`h-1.5 rounded-full ${p.color} animate-pulse`} style={{ animationDelay: `${i * 300}ms` }} />
+                    <p className="text-[10px] text-muted-foreground mt-1">{p.label}</p>
+                  </div>
+                ))}
+              </div>
             </div>
           ) : !result ? (
             <div className="h-full min-h-[500px] flex flex-col items-center justify-center p-8 bg-card/50 rounded-2xl border-2 border-dashed border-border/40">
@@ -263,6 +321,17 @@ export default function NewConsultation() {
                   {t("dashboard", "demoMode", lang)}
                 </div>
               )}
+
+              {/* Export / Share actions */}
+              <div className="flex items-center gap-2 px-4 py-2 border-b border-border/30 bg-muted/20">
+                <Button variant="ghost" size="sm" className="h-7 text-xs gap-1.5" onClick={handleExportPdf}>
+                  <Download className="w-3.5 h-3.5" /> {t("dashboard", "exportPdf", lang)}
+                </Button>
+                <Button variant="ghost" size="sm" className="h-7 text-xs gap-1.5" onClick={handleCopyReport}>
+                  <Copy className="w-3.5 h-3.5" /> {t("dashboard", "shareReport", lang)}
+                </Button>
+              </div>
+
               <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
                 <div className="bg-muted/30 border-b border-border/50 p-2">
                   <TabsList className="w-full grid grid-cols-3 h-auto p-1 bg-background/50 rounded-xl">

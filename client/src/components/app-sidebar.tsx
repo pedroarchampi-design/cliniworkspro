@@ -25,13 +25,19 @@ const PLAN_COLORS: Record<string, string> = {
   diamond: "bg-primary/20 text-primary border-primary/20",
 };
 
+const PIPELINE_LABELS: Record<string, Record<string, string>> = {
+  whisper_stt: { pt: "Voz para Texto", en: "Voice to Text", es: "Voz a Texto" },
+  clinical_analysis: { pt: "Analise Clinica", en: "Clinical Analysis", es: "Analisis Clinico" },
+  image_analysis: { pt: "Analise de Imagem", en: "Image Analysis", es: "Analisis de Imagen" },
+  patient_education: { pt: "Ed. Paciente", en: "Patient Ed.", es: "Ed. Paciente" },
+};
+
 export function AppSidebar() {
   const [location] = useLocation();
   const { auth, logout } = useAuth();
   const { lang } = useLanguage();
 
   const { data: aiStatus } = useQuery<{
-    openai: boolean;
     anyAI: boolean;
     providers: Record<string, boolean>;
     pipelines: Record<string, { available: boolean }>;
@@ -106,23 +112,24 @@ export function AppSidebar() {
         {aiStatus && (
           <SidebarGroup className="mt-2">
             <SidebarGroupLabel className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2 px-2">
-              Pipelines de IA
+              {t("sidebar", "pipelinesTitle", lang)}
             </SidebarGroupLabel>
             <div className="px-3 py-3 bg-sidebar-accent/50 rounded-xl border border-sidebar-border/50 mx-1 space-y-2">
               <div className="flex justify-between items-center text-xs">
-                <span className="text-muted-foreground">Status</span>
+                <span className="text-muted-foreground">{t("sidebar", "pipelineStatus", lang)}</span>
                 <span className={`font-bold ${activePipelines === totalPipelines ? "text-emerald-400" : activePipelines > 0 ? "text-yellow-400" : "text-destructive"}`}>
-                  {activePipelines}/{totalPipelines} ativos
+                  {activePipelines}/{totalPipelines} {t("sidebar", "pipelineActive", lang)}
                 </span>
               </div>
               <div className="grid grid-cols-4 gap-1">
                 {["whisper_stt", "clinical_analysis", "image_analysis", "patient_education"].map((key) => {
                   const available = aiStatus.pipelines?.[key]?.available;
+                  const label = PIPELINE_LABELS[key]?.[lang] || key;
                   return (
                     <div
                       key={key}
                       className={`h-1.5 rounded-full ${available ? "bg-emerald-500" : "bg-muted-foreground/30"}`}
-                      title={`${key}: ${available ? "ativo" : "inativo"}`}
+                      title={`${label}: ${available ? "ativo" : "inativo"}`}
                     />
                   );
                 })}
@@ -164,7 +171,7 @@ export function AppSidebar() {
                   <span className="text-sm font-bold text-foreground">Fazer Upgrade</span>
                 </div>
                 <p className="text-[11px] text-muted-foreground leading-tight">
-                  Desbloqueie consultas ilimitadas e análise de imagens
+                  Desbloqueie consultas ilimitadas e analise de imagens
                 </p>
               </div>
             </Link>
