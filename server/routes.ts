@@ -5,163 +5,116 @@ import { api } from "@shared/routes";
 import { z } from "zod";
 import OpenAI, { toFile } from "openai";
 
+// ══════════════════════════════════════════════════════════════════
+// CONFIGURATION
+// ══════════════════════════════════════════════════════════════════
+
 const REAL_API = process.env.REAL_API_URL || "https://deltascan-api-pxtie6c4zq-uc.a.run.app";
 const GOOGLE_TOKEN = process.env.GOOGLE_API_KEY || "";
 
-// FIX: Max base64 payload sizes (in characters ≈ 75% of decoded bytes)
 const MAX_AUDIO_BASE64_LENGTH = 20_000_000; // ~15MB decoded
 const MAX_IMAGE_BASE64_LENGTH = 15_000_000; // ~11MB decoded
 
+// ── OpenAI Client (primary provider) ──────────────────────────────
+const OPENAI_KEY = process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY || "";
+const OPENAI_BASE = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://api.openai.com/v1";
+
 const openai = new OpenAI({
-  apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
-  baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
+  apiKey: OPENAI_KEY,
+  baseURL: OPENAI_BASE,
 });
 
-async function realApiGet(path: string) {
-  const resp = await fetch(`${REAL_API}${path}`, {
-    headers: { Authorization: `Bearer ${GOOGLE_TOKEN}` },
-  });
-  if (!resp.ok) throw new Error(`Real API error ${resp.status}`);
-  return resp.json();
+// ── DeepSeek Client (fallback for clinical analysis) ──────────────
+const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY || "";
+const deepseek = DEEPSEEK_KEY ? new OpenAI({
+  apiKey: DEEPSEEK_KEY,
+  baseURL: "https://api.deepseek.com/v1",
+}) : null;
+
+// ── Perplexity Client (fallback for patient education) ────────────
+const PERPLEXITY_KEY = process.env.PERPLEXITY_API_KEY || "";
+const perplexity = PERPLEXITY_KEY ? new OpenAI({
+  apiKey: PERPLEXITY_KEY,
+  baseURL: "https://api.perplexity.ai",
+}) : null;
+
+// ── Grok/xAI Client (fallback) ───────────────────────────────────
+const XAI_KEY = process.env.XAI_API_KEY || "";
+const grok = XAI_KEY ? new OpenAI({
+  apiKey: XAI_KEY,
+  baseURL: "https://api.x.ai/v1",
+}) : null;
+
+// ══════════════════════════════════════════════════════════════════
+// AI PIPELINE FUNCTIONS
+// ══════════════════════════════════════════════════════════════════
+
+type AIProvider = "openai" | "deepseek" | "perplexity" | "grok";
+
+interface PipelineLog {
+  step: string;
+  provider: AIProvider;
+  status: "success" | "error" | "skipped";
+  durationMs: number;
+  error?: string;
 }
 
-async function runClinicalAnalysis(prompt: string): Promise<string> {
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0.2,
-    max_tokens: 4096,
-  });
-  const text = resp.choices[0]?.message?.content;
-  if (!text) throw new Error("Empty response from AI");
-  return text;
-}
+/**
+ * Pipeline 1: Whisper STT — Voice Transcription
+ * Primary: OpenAI whisper-1
+ */
+async function pipelineWhisperSTT(audioBase64: string): Promise<{ text: string; log: PipelineLog }> {
+  const start = Date.now();
+  try {
+    const audioRaw = audioBase64.includes(",")
+      ? audioBase64.split(",")[1]
+      : audioBase64;
+    const audioMime = audioBase64.startsWith("data:")
+      ? audioBase64.split(";")[0].split(":")[1]
+      : "audio/webm";
+    const ext = audioMime.split("/")[1]?.replace("mpeg", "mp3") || "webm";
 
-async function runImageAnalysis(imageBase64: string, mimeType: string, prompt: string): Promise<string> {
-  const resp = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [{
-      role: "user",
-      content: [
-        { type: "text", text: prompt },
-        { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}`, detail: "high" } },
-      ],
-    }],
-    temperature: 0.2,
-    max_tokens: 2048,
-  });
-  const text = resp.choices[0]?.message?.content;
-  if (!text) throw new Error("Empty vision response from AI");
-  return text;
-}
+    const audioBuffer = Buffer.from(audioRaw, "base64");
+    const file = await toFile(audioBuffer, `audio.${ext}`, { type: audioMime });
 
-export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
-
-  // ── Health / Status ─────────────────────────────────────────────────────────
-  app.get("/api/status", async (_req, res) => {
-    try {
-      const health = await fetch(`${REAL_API}/health`).then(r => r.json());
-      res.json({ local: "ok", cloudRun: health });
-    } catch {
-      res.json({ local: "ok", cloudRun: "unreachable" });
-    }
-  });
-
-  // ── AI Key Status ────────────────────────────────────────────────────────────
-  app.get("/api/ai-status", async (_req, res) => {
-    const hasIntegration = !!(process.env.AI_INTEGRATIONS_OPENAI_API_KEY && process.env.AI_INTEGRATIONS_OPENAI_BASE_URL);
-    res.json({
-      openai: hasIntegration,
-      whisper: hasIntegration,
-      imageAnalysis: hasIntegration,
-      anyAI: hasIntegration,
-      provider: hasIntegration ? "replit-ai-integrations" : "none",
+    const resp = await openai.audio.transcriptions.create({
+      file,
+      model: "whisper-1",
+      language: "pt",
     });
-  });
 
-  // ── Patients (proxied from real Cloud Run API) ───────────────────────────────
-  app.get("/api/patients", async (_req, res) => {
-    try {
-      const patients = await realApiGet("/api/patients");
-      res.json(patients);
-    } catch {
-      res.json([]);
-    }
-  });
+    console.log("[Pipeline 1 - Whisper STT] OK: length =", resp.text.length);
+    return {
+      text: resp.text,
+      log: { step: "whisper_stt", provider: "openai", status: "success", durationMs: Date.now() - start },
+    };
+  } catch (e: any) {
+    console.error("[Pipeline 1 - Whisper STT] Error:", e.message);
+    return {
+      text: "",
+      log: { step: "whisper_stt", provider: "openai", status: "error", durationMs: Date.now() - start, error: e.message },
+    };
+  }
+}
 
-  // ── Pipelines list (proxied from real Cloud Run API) ────────────────────────
-  app.get("/api/pipelines", async (_req, res) => {
-    try {
-      const pipelines = await realApiGet("/pipelines");
-      res.json(pipelines);
-    } catch {
-      res.json({ pipelines: [] });
-    }
-  });
+/**
+ * Pipeline 2: Clinical Analysis — Hypotheses + Care Plan
+ * Primary: OpenAI GPT-4o | Fallback: DeepSeek | Fallback: Grok
+ */
+async function pipelineClinicalAnalysis(
+  transcription: string,
+  specialty: string,
+  notes?: string
+): Promise<{ hypotheses: any[]; carePlan: any; log: PipelineLog }> {
+  const start = Date.now();
 
-  // ── Consultations: list ──────────────────────────────────────────────────────
-  app.get(api.consultations.list.path, async (req, res) => {
-    const doctorId = req.query.doctorId as string || "demo_doctor";
-    const items = await storage.getConsultationsByDoctor(doctorId);
-    res.json({ consultations: items });
-  });
+  const consultationContext = [
+    transcription && `TRANSCRIÇÃO / NOTAS DA CONSULTA:\n${transcription}`,
+    notes && `NOTAS ADICIONAIS DO MÉDICO:\n${notes}`,
+    specialty && `ESPECIALIDADE DO MÉDICO: ${specialty}`,
+  ].filter(Boolean).join("\n\n");
 
-  // ── Consultations: create (full AI pipeline) ─────────────────────────────────
-  app.post(api.consultations.create.path, async (req, res) => {
-    try {
-      const input = api.consultations.create.input.parse(req.body);
-
-      // FIX: Validate base64 payload sizes
-      if (input.audioBase64 && input.audioBase64.length > MAX_AUDIO_BASE64_LENGTH) {
-        return res.status(400).json({ message: "Audio file too large. Maximum ~15MB.", field: "audioBase64" });
-      }
-      if (input.imageBase64 && input.imageBase64.length > MAX_IMAGE_BASE64_LENGTH) {
-        return res.status(400).json({ message: "Image file too large. Maximum ~11MB.", field: "imageBase64" });
-      }
-
-      let transcription = "";
-      let hypotheses: any[] = [];
-      let carePlan: any = {};
-      let patientMaterials: any = {};
-      let imageImpression: string | null = null;
-
-      // ── 1. Voice Transcription (Whisper via Replit AI) ────────────────────
-      if (input.audioBase64) {
-        try {
-          const audioRaw = input.audioBase64.includes(",")
-            ? input.audioBase64.split(",")[1]
-            : input.audioBase64;
-          const audioMime = input.audioBase64.startsWith("data:")
-            ? input.audioBase64.split(";")[0].split(":")[1]
-            : "audio/webm";
-          const ext = audioMime.split("/")[1]?.replace("mpeg", "mp3") || "webm";
-
-          const audioBuffer = Buffer.from(audioRaw, "base64");
-          const file = await toFile(audioBuffer, `audio.${ext}`, { type: audioMime });
-
-          const whisperResp = await openai.audio.transcriptions.create({
-            file,
-            model: "gpt-4o-mini-transcribe",
-            language: "pt",
-          });
-          transcription = whisperResp.text;
-          console.log("[Whisper] OK: transcription length =", transcription.length);
-        } catch (e: any) {
-          console.error("[Whisper] Error:", e.message);
-          transcription = input.doctorNotes || "";
-        }
-      } else {
-        transcription = input.doctorNotes || "";
-      }
-
-      // ── 2. Clinical Analysis (GPT-4o via Replit AI) ───────────────────────
-      try {
-        const consultationContext = [
-          transcription && `TRANSCRIÇÃO / NOTAS DA CONSULTA:\n${transcription}`,
-          input.doctorSpecialty && `ESPECIALIDADE DO MÉDICO: ${input.doctorSpecialty}`,
-        ].filter(Boolean).join("\n\n");
-
-        const clinicalPrompt = `Você é um assistente clínico de alta precisão especializado em ${input.doctorSpecialty || "Medicina Geral"}.
+  const clinicalPrompt = `Você é um assistente clínico de alta precisão especializado em ${specialty || "Medicina Geral"}.
 
 Com base nos dados da consulta abaixo, gere uma análise clínica estruturada e detalhada.
 IMPORTANTE: Sempre use "hipótese diagnóstica", nunca "diagnóstico definitivo".
@@ -187,19 +140,134 @@ Responda APENAS em JSON válido (sem markdown, sem texto extra):
   }
 }`;
 
-        const clinicalRaw = await runClinicalAnalysis(clinicalPrompt);
-        const cleanJson = clinicalRaw.replace(/```json|```/g, "").trim();
-        const clinicalData = JSON.parse(cleanJson);
-        hypotheses = clinicalData.hypotheses || [];
-        carePlan = clinicalData.care_plan || {};
-        console.log("[GPT-4o] Clinical analysis OK:", hypotheses.length, "hypotheses");
+  // Try providers in order: OpenAI → DeepSeek → Grok
+  const providers: { name: AIProvider; client: OpenAI; model: string }[] = [
+    { name: "openai", client: openai, model: "gpt-4o" },
+    ...(deepseek ? [{ name: "deepseek" as AIProvider, client: deepseek, model: "deepseek-chat" }] : []),
+    ...(grok ? [{ name: "grok" as AIProvider, client: grok, model: "grok-2-latest" }] : []),
+  ];
 
-        // ── 3. Patient Education Materials ────────────────────────────────
-        const topCondition = hypotheses[0]?.condition || "condição avaliada";
-        const patientPrompt = `Você é um educador médico especialista em comunicação com pacientes.
+  for (const { name, client, model } of providers) {
+    try {
+      const resp = await client.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: clinicalPrompt }],
+        temperature: 0.2,
+        max_tokens: 4096,
+      });
+
+      const raw = resp.choices[0]?.message?.content;
+      if (!raw) throw new Error("Empty response");
+
+      const cleanJson = raw.replace(/```json|```/g, "").trim();
+      const data = JSON.parse(cleanJson);
+
+      console.log(`[Pipeline 2 - Clinical Analysis] OK via ${name}:`, data.hypotheses?.length, "hypotheses");
+      return {
+        hypotheses: data.hypotheses || [],
+        carePlan: data.care_plan || {},
+        log: { step: "clinical_analysis", provider: name, status: "success", durationMs: Date.now() - start },
+      };
+    } catch (e: any) {
+      console.warn(`[Pipeline 2 - Clinical Analysis] ${name} failed:`, e.message);
+      continue;
+    }
+  }
+
+  // All providers failed
+  return {
+    hypotheses: [{ rank: 1, condition: "Análise indisponível", reasoning: "Nenhum provedor de IA respondeu. Verifique as chaves de API.", probability: "baixa", icd10: "" }],
+    carePlan: { immediate_actions: [], exams: [], prescription: "", follow_up: "" },
+    log: { step: "clinical_analysis", provider: "openai", status: "error", durationMs: Date.now() - start, error: "All providers failed" },
+  };
+}
+
+/**
+ * Pipeline 3: Image Analysis — GPT-4o Vision
+ * Primary: OpenAI GPT-4o Vision | Fallback: Grok Vision
+ */
+async function pipelineImageAnalysis(
+  imageBase64: string,
+  specialty: string
+): Promise<{ impression: string; log: PipelineLog }> {
+  const start = Date.now();
+
+  const imageRaw = imageBase64.includes(",")
+    ? imageBase64.split(",")[1]
+    : imageBase64;
+  const imageMime = imageBase64.startsWith("data:")
+    ? imageBase64.split(";")[0].split(":")[1]
+    : "image/jpeg";
+
+  const visionPrompt = `Você é um especialista em radiologia e medicina de imagem com 20 anos de experiência clínica.
+
+Analise esta imagem médica com máximo rigor técnico para auxiliar o médico especialista em ${specialty || "Medicina Geral"}.
+
+Estruture sua análise em:
+1. IDENTIFICAÇÃO: Tipo de exame de imagem e qualidade técnica
+2. ACHADOS NORMAIS: Estruturas anatômicas dentro dos limites normais
+3. ACHADOS ANORMAIS: Alterações, áreas suspeitas ou patológicas identificadas
+4. CARACTERÍSTICAS TÉCNICAS: Ecogenicidade, dimensões estimadas, margens, densidade, etc.
+5. CORRELAÇÃO CLÍNICA: Possível correlação com o quadro clínico
+6. RECOMENDAÇÕES: Exames complementares ou seguimento sugerido
+
+IMPORTANTE: Esta é uma impressão técnica para o médico, NÃO um diagnóstico final para o paciente.`;
+
+  const providers: { name: AIProvider; client: OpenAI; model: string }[] = [
+    { name: "openai", client: openai, model: "gpt-4o" },
+    ...(grok ? [{ name: "grok" as AIProvider, client: grok, model: "grok-2-vision-1212" }] : []),
+  ];
+
+  for (const { name, client, model } of providers) {
+    try {
+      const resp = await client.chat.completions.create({
+        model,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: visionPrompt },
+            { type: "image_url", image_url: { url: `data:${imageMime};base64,${imageRaw}`, detail: "high" } },
+          ],
+        }],
+        temperature: 0.2,
+        max_tokens: 2048,
+      });
+
+      const text = resp.choices[0]?.message?.content;
+      if (!text) throw new Error("Empty vision response");
+
+      console.log(`[Pipeline 3 - Image Analysis] OK via ${name}`);
+      return {
+        impression: text,
+        log: { step: "image_analysis", provider: name, status: "success", durationMs: Date.now() - start },
+      };
+    } catch (e: any) {
+      console.warn(`[Pipeline 3 - Image Analysis] ${name} failed:`, e.message);
+      continue;
+    }
+  }
+
+  return {
+    impression: "Análise de imagem não disponível. Verifique as chaves de API.",
+    log: { step: "image_analysis", provider: "openai", status: "error", durationMs: Date.now() - start, error: "All providers failed" },
+  };
+}
+
+/**
+ * Pipeline 4: Patient Education Materials
+ * Primary: OpenAI GPT-4o | Fallback: Perplexity | Fallback: DeepSeek
+ */
+async function pipelinePatientEducation(
+  topCondition: string,
+  specialty: string,
+  carePlan: any
+): Promise<{ materials: any; log: PipelineLog }> {
+  const start = Date.now();
+
+  const patientPrompt = `Você é um educador médico especialista em comunicação com pacientes.
 
 Condição principal: ${topCondition}
-Especialidade: ${input.doctorSpecialty}
+Especialidade: ${specialty}
 Plano de cuidado resumido: ${JSON.stringify(carePlan).slice(0, 500)}
 
 Gere material educativo em linguagem MUITO simples, acolhedora e clara para um paciente sem formação médica.
@@ -213,54 +281,202 @@ Responda APENAS em JSON válido:
   ]
 }`;
 
-        const patientRaw = await runClinicalAnalysis(patientPrompt);
-        const cleanPatient = patientRaw.replace(/```json|```/g, "").trim();
-        patientMaterials = JSON.parse(cleanPatient);
-        console.log("[GPT-4o] Patient materials OK");
+  const providers: { name: AIProvider; client: OpenAI; model: string }[] = [
+    { name: "openai", client: openai, model: "gpt-4o" },
+    ...(perplexity ? [{ name: "perplexity" as AIProvider, client: perplexity, model: "sonar" }] : []),
+    ...(deepseek ? [{ name: "deepseek" as AIProvider, client: deepseek, model: "deepseek-chat" }] : []),
+    ...(grok ? [{ name: "grok" as AIProvider, client: grok, model: "grok-2-latest" }] : []),
+  ];
 
-      } catch (e: any) {
-        console.error("[GPT-4o] Clinical analysis error:", e.message);
-        hypotheses = [{
-          rank: 1,
-          condition: "Erro na análise",
-          reasoning: `Não foi possível processar: ${e.message}`,
-          probability: "baixa",
-          icd10: "",
-        }];
+  for (const { name, client, model } of providers) {
+    try {
+      const resp = await client.chat.completions.create({
+        model,
+        messages: [{ role: "user", content: patientPrompt }],
+        temperature: 0.4,
+        max_tokens: 2048,
+      });
+
+      const raw = resp.choices[0]?.message?.content;
+      if (!raw) throw new Error("Empty response");
+
+      const cleanJson = raw.replace(/```json|```/g, "").trim();
+      const data = JSON.parse(cleanJson);
+
+      console.log(`[Pipeline 4 - Patient Education] OK via ${name}`);
+      return {
+        materials: data,
+        log: { step: "patient_education", provider: name, status: "success", durationMs: Date.now() - start },
+      };
+    } catch (e: any) {
+      console.warn(`[Pipeline 4 - Patient Education] ${name} failed:`, e.message);
+      continue;
+    }
+  }
+
+  return {
+    materials: {
+      simple_explanation: "Material educativo não disponível no momento.",
+      daily_guidelines: [],
+      alert_signs: [],
+      faq: [],
+    },
+    log: { step: "patient_education", provider: "openai", status: "error", durationMs: Date.now() - start, error: "All providers failed" },
+  };
+}
+
+// ══════════════════════════════════════════════════════════════════
+// ROUTES
+// ══════════════════════════════════════════════════════════════════
+
+async function realApiGet(path: string) {
+  const resp = await fetch(`${REAL_API}${path}`, {
+    headers: { Authorization: `Bearer ${GOOGLE_TOKEN}` },
+  });
+  if (!resp.ok) throw new Error(`Real API error ${resp.status}`);
+  return resp.json();
+}
+
+export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+
+  // ── Health / Status ─────────────────────────────────────────────
+  app.get("/api/status", async (_req, res) => {
+    try {
+      const health = await fetch(`${REAL_API}/health`).then(r => r.json());
+      res.json({ local: "ok", cloudRun: health });
+    } catch {
+      res.json({ local: "ok", cloudRun: "unreachable" });
+    }
+  });
+
+  // ── AI Key Status (detailed pipeline status) ────────────────────
+  app.get("/api/ai-status", async (_req, res) => {
+    const hasOpenAI = !!OPENAI_KEY;
+    const hasDeepSeek = !!DEEPSEEK_KEY;
+    const hasPerplexity = !!PERPLEXITY_KEY;
+    const hasGrok = !!XAI_KEY;
+    const hasGoogle = !!GOOGLE_TOKEN;
+
+    res.json({
+      openai: hasOpenAI,
+      whisper: hasOpenAI,
+      imageAnalysis: hasOpenAI || hasGrok,
+      anyAI: hasOpenAI || hasDeepSeek || hasPerplexity || hasGrok,
+      providers: {
+        openai: hasOpenAI,
+        deepseek: hasDeepSeek,
+        perplexity: hasPerplexity,
+        grok: hasGrok,
+        google: hasGoogle,
+      },
+      pipelines: {
+        whisper_stt: { available: hasOpenAI, provider: "openai" },
+        clinical_analysis: { available: hasOpenAI || hasDeepSeek || hasGrok, providers: [hasOpenAI && "openai", hasDeepSeek && "deepseek", hasGrok && "grok"].filter(Boolean) },
+        image_analysis: { available: hasOpenAI || hasGrok, providers: [hasOpenAI && "openai", hasGrok && "grok"].filter(Boolean) },
+        patient_education: { available: hasOpenAI || hasPerplexity || hasDeepSeek || hasGrok, providers: [hasOpenAI && "openai", hasPerplexity && "perplexity", hasDeepSeek && "deepseek", hasGrok && "grok"].filter(Boolean) },
+      },
+    });
+  });
+
+  // ── Patients (proxied from real Cloud Run API) ──────────────────
+  app.get("/api/patients", async (_req, res) => {
+    try {
+      const patients = await realApiGet("/api/patients");
+      res.json(patients);
+    } catch {
+      res.json([]);
+    }
+  });
+
+  // ── Pipelines list (proxied from real Cloud Run API) ────────────
+  app.get("/api/pipelines", async (_req, res) => {
+    try {
+      const pipelines = await realApiGet("/pipelines");
+      res.json(pipelines);
+    } catch {
+      res.json({
+        pipelines: [
+          { id: 1, name: "Whisper STT", description: "Transcrição de voz para texto", status: OPENAI_KEY ? "active" : "inactive" },
+          { id: 2, name: "Clinical Analysis", description: "Análise clínica com hipóteses diagnósticas", status: (OPENAI_KEY || DEEPSEEK_KEY || XAI_KEY) ? "active" : "inactive" },
+          { id: 3, name: "Image Analysis", description: "Análise de imagens médicas (GPT-4o Vision)", status: (OPENAI_KEY || XAI_KEY) ? "active" : "inactive" },
+          { id: 4, name: "Patient Education", description: "Materiais educativos para o paciente", status: (OPENAI_KEY || PERPLEXITY_KEY || DEEPSEEK_KEY) ? "active" : "inactive" },
+        ],
+      });
+    }
+  });
+
+  // ── Consultations: list ─────────────────────────────────────────
+  app.get(api.consultations.list.path, async (req, res) => {
+    const doctorId = req.query.doctorId as string || "demo_doctor";
+    const items = await storage.getConsultationsByDoctor(doctorId);
+    res.json({ consultations: items });
+  });
+
+  // ── Consultations: create (full AI pipeline) ────────────────────
+  app.post(api.consultations.create.path, async (req, res) => {
+    try {
+      const input = api.consultations.create.input.parse(req.body);
+      const pipelineLogs: PipelineLog[] = [];
+
+      // Validate payload sizes
+      if (input.audioBase64 && input.audioBase64.length > MAX_AUDIO_BASE64_LENGTH) {
+        return res.status(400).json({ message: "Arquivo de áudio muito grande. Máximo ~15MB.", field: "audioBase64" });
+      }
+      if (input.imageBase64 && input.imageBase64.length > MAX_IMAGE_BASE64_LENGTH) {
+        return res.status(400).json({ message: "Arquivo de imagem muito grande. Máximo ~11MB.", field: "imageBase64" });
       }
 
-      // ── 4. Image Analysis (GPT-4o Vision via Replit AI) ───────────────────
+      let transcription = "";
+      let hypotheses: any[] = [];
+      let carePlan: any = {};
+      let patientMaterials: any = {};
+      let imageImpression: string | null = null;
+
+      // ── Pipeline 1: Whisper STT ──────────────────────────────────
+      if (input.audioBase64) {
+        const whisperResult = await pipelineWhisperSTT(input.audioBase64);
+        transcription = whisperResult.text || input.doctorNotes || "";
+        pipelineLogs.push(whisperResult.log);
+      } else {
+        transcription = input.doctorNotes || "";
+        pipelineLogs.push({ step: "whisper_stt", provider: "openai", status: "skipped", durationMs: 0 });
+      }
+
+      // ── Pipeline 2: Clinical Analysis ────────────────────────────
+      if (transcription || input.doctorNotes) {
+        const clinicalResult = await pipelineClinicalAnalysis(
+          transcription,
+          input.doctorSpecialty,
+          input.doctorNotes
+        );
+        hypotheses = clinicalResult.hypotheses;
+        carePlan = clinicalResult.carePlan;
+        pipelineLogs.push(clinicalResult.log);
+
+        // ── Pipeline 4: Patient Education ──────────────────────────
+        const topCondition = hypotheses[0]?.condition || "condição avaliada";
+        const educationResult = await pipelinePatientEducation(
+          topCondition,
+          input.doctorSpecialty,
+          carePlan
+        );
+        patientMaterials = educationResult.materials;
+        pipelineLogs.push(educationResult.log);
+      } else {
+        pipelineLogs.push({ step: "clinical_analysis", provider: "openai", status: "skipped", durationMs: 0 });
+        pipelineLogs.push({ step: "patient_education", provider: "openai", status: "skipped", durationMs: 0 });
+      }
+
+      // ── Pipeline 3: Image Analysis ───────────────────────────────
       if (input.imageBase64) {
-        try {
-          const imageRaw = input.imageBase64.includes(",")
-            ? input.imageBase64.split(",")[1]
-            : input.imageBase64;
-          const imageMime = input.imageBase64.startsWith("data:")
-            ? input.imageBase64.split(";")[0].split(":")[1]
-            : "image/jpeg";
-
-          const visionPrompt = `Você é um especialista em radiologia e medicina de imagem com 20 anos de experiência clínica.
-
-Analise esta imagem médica com máximo rigor técnico para auxiliar o médico especialista em ${input.doctorSpecialty || "Medicina Geral"}.
-
-Estruture sua análise em:
-1. IDENTIFICAÇÃO: Tipo de exame de imagem e qualidade técnica
-2. ACHADOS NORMAIS: Estruturas anatômicas dentro dos limites normais
-3. ACHADOS ANORMAIS: Alterações, áreas suspeitas ou patológicas identificadas
-4. CARACTERÍSTICAS TÉCNICAS: Ecogenicidade, dimensões estimadas, margens, densidade, etc.
-5. CORRELAÇÃO CLÍNICA: Possível correlação com o quadro clínico
-6. RECOMENDAÇÕES: Exames complementares ou seguimento sugerido
-
-IMPORTANTE: Esta é uma impressão técnica para o médico, NÃO um diagnóstico final para o paciente.`;
-
-          imageImpression = await runImageAnalysis(imageRaw, imageMime, visionPrompt);
-          console.log("[GPT-4o Vision] Image analysis OK");
-        } catch (e: any) {
-          console.error("[GPT-4o Vision] Error:", e.message);
-          imageImpression = `Análise de imagem não disponível: ${e.message}`;
-        }
+        const imageResult = await pipelineImageAnalysis(input.imageBase64, input.doctorSpecialty);
+        imageImpression = imageResult.impression;
+        pipelineLogs.push(imageResult.log);
+      } else {
+        pipelineLogs.push({ step: "image_analysis", provider: "openai", status: "skipped", durationMs: 0 });
       }
 
+      // ── Save to storage ──────────────────────────────────────────
       const newConsultation = await storage.createConsultation({
         doctorId: input.doctorId || "demo_doctor",
         patientId: input.patientId,
@@ -273,7 +489,18 @@ IMPORTANTE: Esta é uma impressão técnica para o médico, NÃO um diagnóstico
         imageImpression,
       });
 
-      res.status(201).json({ status: "saved", consultationId: newConsultation.id, data: newConsultation });
+      // Log pipeline summary (LGPD safe — no medical data)
+      const totalMs = pipelineLogs.reduce((sum, l) => sum + l.durationMs, 0);
+      console.log(`[Consultation ${newConsultation.id}] Pipeline complete in ${totalMs}ms:`,
+        pipelineLogs.map(l => `${l.step}=${l.status}(${l.provider},${l.durationMs}ms)`).join(" | ")
+      );
+
+      res.status(201).json({
+        status: "saved",
+        consultationId: newConsultation.id,
+        data: newConsultation,
+        pipeline: pipelineLogs,
+      });
     } catch (err) {
       if (err instanceof z.ZodError) {
         return res.status(400).json({ message: err.errors[0].message, field: err.errors[0].path.join(".") });
@@ -283,14 +510,14 @@ IMPORTANTE: Esta é uma impressão técnica para o médico, NÃO um diagnóstico
     }
   });
 
-  // ── Consultations: get by ID ─────────────────────────────────────────────────
+  // ── Consultations: get by ID ────────────────────────────────────
   app.get(api.consultations.get.path, async (req, res) => {
     const consultation = await storage.getConsultation(Number(req.params.id));
     if (!consultation) return res.status(404).json({ message: "Not found" });
     res.json(consultation);
   });
 
-  // ── Subscription checkout ────────────────────────────────────────────────────
+  // ── Subscription checkout ───────────────────────────────────────
   app.post(api.subscription.checkout.path, async (req, res) => {
     try {
       const input = api.subscription.checkout.input.parse(req.body);
@@ -305,7 +532,6 @@ IMPORTANTE: Esta é uma impressão técnica para o médico, NÃO um diagnóstico
           if (data.url) return res.json({ checkout_url: data.url });
         }
       } catch {}
-      // FIX: Return a clearer demo fallback instead of fake Stripe URL
       res.json({ checkout_url: `/settings?plan=${input.plan}&demo=true` });
     } catch (err) {
       if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });

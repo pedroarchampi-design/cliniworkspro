@@ -1,5 +1,5 @@
 import { Link, useLocation } from "wouter";
-import { ActivitySquare, Clock, Settings, Stethoscope, BarChart3 } from "lucide-react";
+import { ActivitySquare, Clock, Settings, Stethoscope, BarChart3, Sparkles, LogOut } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -13,8 +13,10 @@ import {
   SidebarFooter,
 } from "@/components/ui/sidebar";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { useAuth } from "@/hooks/use-auth";
 import { useLanguage } from "@/hooks/use-language";
+import { useQuery } from "@tanstack/react-query";
 import { t, tNested } from "@/lib/i18n";
 
 const PLAN_COLORS: Record<string, string> = {
@@ -25,8 +27,18 @@ const PLAN_COLORS: Record<string, string> = {
 
 export function AppSidebar() {
   const [location] = useLocation();
-  const { auth } = useAuth();
+  const { auth, logout } = useAuth();
   const { lang } = useLanguage();
+
+  const { data: aiStatus } = useQuery<{
+    openai: boolean;
+    anyAI: boolean;
+    providers: Record<string, boolean>;
+    pipelines: Record<string, { available: boolean }>;
+  }>({
+    queryKey: ["/api/ai-status"],
+    refetchInterval: 60000,
+  });
 
   const navItems = [
     { titleKey: "newConsultation" as const, href: "/dashboard", icon: ActivitySquare },
@@ -37,6 +49,11 @@ export function AppSidebar() {
   const usagePct = Math.min(100, (auth.usageCount / auth.usageLimit) * 100);
   const planLabel = tNested("sidebar", "planLabel", auth.plan, lang);
 
+  const activePipelines = aiStatus?.pipelines
+    ? Object.values(aiStatus.pipelines).filter(p => p.available).length
+    : 0;
+  const totalPipelines = 4;
+
   return (
     <Sidebar className="border-r border-sidebar-border bg-sidebar">
       <SidebarHeader className="p-4 pt-6">
@@ -44,7 +61,10 @@ export function AppSidebar() {
           <div className="bg-primary/15 p-2 rounded-xl">
             <Stethoscope className="w-5 h-5 text-primary" />
           </div>
-          <h1 className="text-lg font-bold tracking-tight">DeltaScan</h1>
+          <div>
+            <h1 className="text-lg font-bold tracking-tight">DeltaScan</h1>
+            <p className="text-[10px] text-muted-foreground font-medium tracking-wider uppercase">AI Clinical Assistant</p>
+          </div>
         </div>
       </SidebarHeader>
 
@@ -82,8 +102,37 @@ export function AppSidebar() {
           </SidebarGroupContent>
         </SidebarGroup>
 
+        {/* Pipeline Status */}
+        {aiStatus && (
+          <SidebarGroup className="mt-2">
+            <SidebarGroupLabel className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2 px-2">
+              Pipelines de IA
+            </SidebarGroupLabel>
+            <div className="px-3 py-3 bg-sidebar-accent/50 rounded-xl border border-sidebar-border/50 mx-1 space-y-2">
+              <div className="flex justify-between items-center text-xs">
+                <span className="text-muted-foreground">Status</span>
+                <span className={`font-bold ${activePipelines === totalPipelines ? "text-emerald-400" : activePipelines > 0 ? "text-yellow-400" : "text-destructive"}`}>
+                  {activePipelines}/{totalPipelines} ativos
+                </span>
+              </div>
+              <div className="grid grid-cols-4 gap-1">
+                {["whisper_stt", "clinical_analysis", "image_analysis", "patient_education"].map((key) => {
+                  const available = aiStatus.pipelines?.[key]?.available;
+                  return (
+                    <div
+                      key={key}
+                      className={`h-1.5 rounded-full ${available ? "bg-emerald-500" : "bg-muted-foreground/30"}`}
+                      title={`${key}: ${available ? "ativo" : "inativo"}`}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          </SidebarGroup>
+        )}
+
         {/* Usage meter */}
-        <SidebarGroup className="mt-4">
+        <SidebarGroup className="mt-2">
           <SidebarGroupLabel className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2 px-2">
             {t("settings", "usage", lang)}
           </SidebarGroupLabel>
@@ -93,7 +142,7 @@ export function AppSidebar() {
                 <BarChart3 className="w-3 h-3" /> {t("sidebar", "analyses", lang)}
               </span>
               <span className="font-bold text-foreground" data-testid="text-sidebar-usage">
-                {auth.usageCount}/{auth.usageLimit === 999 ? "∞" : auth.usageLimit}
+                {auth.usageCount}/{auth.usageLimit === 999 ? "\u221e" : auth.usageLimit}
               </span>
             </div>
             <div className="w-full h-1.5 bg-sidebar-border rounded-full overflow-hidden">
@@ -104,6 +153,23 @@ export function AppSidebar() {
             </div>
           </div>
         </SidebarGroup>
+
+        {/* Upgrade CTA */}
+        {auth.plan === "free" && (
+          <SidebarGroup className="mt-2 px-1">
+            <Link href="/upgrade">
+              <div className="bg-gradient-to-r from-primary/20 to-accent/20 border border-primary/30 rounded-xl p-3 cursor-pointer hover:from-primary/30 hover:to-accent/30 transition-all group">
+                <div className="flex items-center gap-2 mb-1">
+                  <Sparkles className="w-4 h-4 text-primary group-hover:scale-110 transition-transform" />
+                  <span className="text-sm font-bold text-foreground">Fazer Upgrade</span>
+                </div>
+                <p className="text-[11px] text-muted-foreground leading-tight">
+                  Desbloqueie consultas ilimitadas e análise de imagens
+                </p>
+              </div>
+            </Link>
+          </SidebarGroup>
+        )}
       </SidebarContent>
 
       <SidebarFooter className="p-4 border-t border-sidebar-border">
@@ -117,6 +183,15 @@ export function AppSidebar() {
               {planLabel}
             </Badge>
           </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 text-muted-foreground hover:text-destructive shrink-0"
+            onClick={logout}
+            title="Sair"
+          >
+            <LogOut className="w-4 h-4" />
+          </Button>
         </div>
       </SidebarFooter>
     </Sidebar>

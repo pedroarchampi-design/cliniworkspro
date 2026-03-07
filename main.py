@@ -1,12 +1,9 @@
 # ============================================================
-# DeltaScan — Single File for Replit
-# Backend (FastAPI + LangGraph) + Frontend (HTML embedded)
-# Env vars needed in Replit Secrets:
-# OPENAI_API_KEY, GOOGLE_APPLICATION_CREDENTIALS_JSON,
-# STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, FIREBASE_CREDENTIALS_JSON
+# DeltaScan — FastAPI + LangGraph Backend
+# Multi-provider AI pipelines: OpenAI, DeepSeek, Perplexity, Grok, Vertex
 # ============================================================
 
-import os, json, base64, asyncio
+import os, json, base64, asyncio, secrets, hashlib, time
 from datetime import datetime
 from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Request
@@ -14,8 +11,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
-# ── Configurar credenciais Google via env var (Replit Secrets) ──
+# ── Load .env if present ──
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
+# ── Configure Google credentials via env var ──
 _gcp_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 if _gcp_creds:
     with open("/tmp/gcp_creds.json", "w") as f:
@@ -27,13 +30,17 @@ if _firebase_creds:
     with open("/tmp/firebase_creds.json", "w") as f:
         f.write(_firebase_creds)
 
-# ── Imports condicionais (falham graciosamente se lib ausente) ──
+# ── Conditional imports ──
 
 try:
     import openai
-    OPENAI_OK = True
+    OPENAI_OK = bool(os.environ.get("OPENAI_API_KEY"))
 except ImportError:
     OPENAI_OK = False
+
+DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+PERPLEXITY_KEY = os.environ.get("PERPLEXITY_API_KEY", "")
+XAI_KEY = os.environ.get("XAI_API_KEY", "")
 
 try:
     import vertexai
@@ -44,7 +51,7 @@ except ImportError:
 
 try:
     from google.cloud import firestore
-    DB = firestore.Client(project=os.environ.get("GCP_PROJECT", "deltarc"))
+    DB = firestore.Client(project=os.environ.get("GCP_PROJECT", "mimiclo"))
     FIRESTORE_OK = True
 except Exception:
     FIRESTORE_OK = False
@@ -63,7 +70,7 @@ except Exception:
 try:
     import stripe
     stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
-    STRIPE_OK = True
+    STRIPE_OK = bool(stripe.api_key)
 except ImportError:
     STRIPE_OK = False
 
@@ -73,6 +80,42 @@ try:
     LANGGRAPH_OK = True
 except ImportError:
     LANGGRAPH_OK = False
+
+# ════════════════════════════════════════════════════════════════
+# MULTI-PROVIDER AI HELPERS
+# ════════════════════════════════════════════════════════════════
+
+def _openai_client(provider="openai"):
+    """Create OpenAI-compatible client for different providers."""
+    if provider == "deepseek" and DEEPSEEK_KEY:
+        return openai.OpenAI(api_key=DEEPSEEK_KEY, base_url="https://api.deepseek.com/v1")
+    elif provider == "perplexity" and PERPLEXITY_KEY:
+        return openai.OpenAI(api_key=PERPLEXITY_KEY, base_url="https://api.perplexity.ai")
+    elif provider == "grok" and XAI_KEY:
+        return openai.OpenAI(api_key=XAI_KEY, base_url="https://api.x.ai/v1")
+    else:
+        return openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+def _chat_with_fallback(prompt: str, providers_config: list) -> str:
+    """Try multiple providers in order until one succeeds."""
+    for cfg in providers_config:
+        try:
+            client = _openai_client(cfg["provider"])
+            resp = client.chat.completions.create(
+                model=cfg["model"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=cfg.get("temperature", 0.2),
+                max_tokens=cfg.get("max_tokens", 4096),
+            )
+            text = resp.choices[0].message.content
+            if text:
+                return text
+        except Exception as e:
+            print(f"[{cfg['provider']}] Failed: {e}")
+            continue
+    return ""
+
 
 # ════════════════════════════════════════════════════════════════
 # PIPELINE LANGGRAPH
@@ -94,11 +137,13 @@ if LANGGRAPH_OK:
         patient_materials: Optional[dict]
         error: Optional[str]
 
-    # ── Agente 1: Transcrição Whisper ──
+    # ── Agent 1: Whisper STT ──
     def agent_transcription(state: dict) -> dict:
         audio_bytes = state.get("audio_bytes")
-        if not audio_bytes or not OPENAI_OK:
-            return {**state, "transcription": "[transcrição simulada para teste]"}
+        if not audio_bytes:
+            return {**state, "transcription": state.get("doctor_notes", "")}
+        if not OPENAI_OK:
+            return {**state, "transcription": state.get("doctor_notes", "[Whisper não disponível]")}
         import io
         client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
         buf = io.BytesIO(audio_bytes)
@@ -106,71 +151,130 @@ if LANGGRAPH_OK:
         resp = client.audio.transcriptions.create(model="whisper-1", file=buf, language="pt")
         return {**state, "transcription": resp.text}
 
-    # ── Agente 2: Hipóteses Clínicas (Gemini/Vertex) ──
+    # ── Agent 2: Clinical Analysis (multi-provider) ──
     def agent_clinical(state: dict) -> dict:
         transcription = state.get("transcription", "")
         specialty = state.get("doctor_specialty", "Clínica Geral")
-        if not transcription or not VERTEX_OK:
-            return {
-                **state,
-                "hypotheses": [{"rank": 1, "condition": "Hipótese simulada", "reasoning": "Modo demo", "probability": "alta"}],
-                "care_plan": {"immediate_actions": ["Ação demo"], "exams": [], "prescription": "Prescrição demo", "follow_up": "7 dias"},
-            }
-        vertexai.init(project=os.environ.get("GCP_PROJECT", "deltarc"), location="us-central1")
-        model = GenerativeModel("gemini-1.5-pro")
+        notes = state.get("doctor_notes", "")
+
         prompt = f"""Você é assistente clínico para médicos de {specialty}.
 
-Com base na transcrição abaixo, gere hipóteses diagnósticas e plano de cuidado.
+Com base na transcrição/notas abaixo, gere hipóteses diagnósticas e plano de cuidado.
 IMPORTANTE: Use sempre "hipótese diagnóstica", nunca "diagnóstico".
 
 Transcrição: {transcription}
+{f"Notas adicionais: {notes}" if notes else ""}
 
 Responda APENAS em JSON:
 {{
-  "hypotheses": [{{"rank":1,"condition":"nome","reasoning":"justificativa","probability":"alta/média/baixa"}}],
+  "hypotheses": [{{"rank":1,"condition":"nome","reasoning":"justificativa detalhada","probability":"alta/média/baixa","icd10":"código"}}],
   "care_plan": {{"immediate_actions":[],"exams":[],"prescription":"texto","follow_up":"orientação"}}
 }}"""
-        resp = model.generate_content(prompt)
-        try:
-            result = json.loads(resp.text.strip().replace("```json", "").replace("```", ""))
-        except Exception:
-            result = {"hypotheses": [], "care_plan": {"prescription": resp.text}}
-        return {**state, "hypotheses": result.get("hypotheses", []), "care_plan": result.get("care_plan", {})}
 
-    # ── Agente 3: Comparação de Imagens ──
+        providers = []
+        if OPENAI_OK:
+            providers.append({"provider": "openai", "model": "gpt-4o"})
+        if DEEPSEEK_KEY:
+            providers.append({"provider": "deepseek", "model": "deepseek-chat"})
+        if XAI_KEY:
+            providers.append({"provider": "grok", "model": "grok-2-latest"})
+        if VERTEX_OK:
+            # Use Vertex separately
+            try:
+                vertexai.init(project=os.environ.get("GCP_PROJECT", "mimiclo"), location="us-central1")
+                model = GenerativeModel("gemini-1.5-pro")
+                resp = model.generate_content(prompt)
+                result = json.loads(resp.text.strip().replace("```json", "").replace("```", ""))
+                return {**state, "hypotheses": result.get("hypotheses", []), "care_plan": result.get("care_plan", {})}
+            except Exception as e:
+                print(f"[Vertex] Clinical failed: {e}")
+
+        if providers:
+            raw = _chat_with_fallback(prompt, providers)
+            if raw:
+                try:
+                    result = json.loads(raw.strip().replace("```json", "").replace("```", ""))
+                    return {**state, "hypotheses": result.get("hypotheses", []), "care_plan": result.get("care_plan", {})}
+                except Exception:
+                    pass
+
+        return {
+            **state,
+            "hypotheses": [{"rank": 1, "condition": "Análise indisponível", "reasoning": "Nenhum provedor de IA respondeu", "probability": "baixa"}],
+            "care_plan": {"immediate_actions": [], "exams": [], "prescription": "", "follow_up": ""},
+        }
+
+    # ── Agent 3: Image Analysis (multi-provider) ──
     def agent_image(state: dict) -> dict:
         image_bytes = state.get("image_bytes")
-        if not image_bytes or not VERTEX_OK:
+        if not image_bytes:
             return {**state, "image_impression": None}
-        vertexai.init(project=os.environ.get("GCP_PROJECT", "deltarc"), location="us-central1")
-        model = GenerativeModel("gemini-1.5-pro-vision")
-        resp = model.generate_content([
-            Part.from_data(data=image_bytes, mime_type="image/jpeg"),
-            "Analise esta imagem médica. Descreva achados relevantes em linguagem técnica. Isso é uma IMPRESSÃO, não um diagnóstico.",
-        ])
-        img_b64 = base64.b64encode(image_bytes).decode()
-        return {**state, "image_impression": resp.text, "image_base64": img_b64}
 
-    # ── Agente 4: Materiais para o Paciente ──
+        specialty = state.get("doctor_specialty", "Medicina Geral")
+        img_b64 = base64.b64encode(image_bytes).decode()
+
+        # Try OpenAI Vision
+        if OPENAI_OK:
+            try:
+                client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+                resp = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Analise esta imagem médica para um {specialty}. Descreva achados em linguagem técnica. IMPRESSÃO, não diagnóstico."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}", "detail": "high"}},
+                        ],
+                    }],
+                    max_tokens=2048,
+                )
+                return {**state, "image_impression": resp.choices[0].message.content, "image_base64": img_b64}
+            except Exception as e:
+                print(f"[OpenAI Vision] Failed: {e}")
+
+        # Try Grok Vision
+        if XAI_KEY:
+            try:
+                client = _openai_client("grok")
+                resp = client.chat.completions.create(
+                    model="grok-2-vision-1212",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Analise esta imagem médica para um {specialty}. IMPRESSÃO técnica."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                        ],
+                    }],
+                    max_tokens=2048,
+                )
+                return {**state, "image_impression": resp.choices[0].message.content, "image_base64": img_b64}
+            except Exception as e:
+                print(f"[Grok Vision] Failed: {e}")
+
+        # Try Vertex
+        if VERTEX_OK:
+            try:
+                vertexai.init(project=os.environ.get("GCP_PROJECT", "mimiclo"), location="us-central1")
+                model = GenerativeModel("gemini-1.5-pro-vision")
+                resp = model.generate_content([
+                    Part.from_data(data=image_bytes, mime_type="image/jpeg"),
+                    f"Analise esta imagem médica para um {specialty}. IMPRESSÃO técnica.",
+                ])
+                return {**state, "image_impression": resp.text, "image_base64": img_b64}
+            except Exception as e:
+                print(f"[Vertex Vision] Failed: {e}")
+
+        return {**state, "image_impression": "Análise de imagem não disponível.", "image_base64": img_b64}
+
+    # ── Agent 4: Patient Education (multi-provider) ──
     def agent_patient(state: dict) -> dict:
         hypotheses = state.get("hypotheses", [])
         care_plan = state.get("care_plan", {})
-        if not VERTEX_OK:
-            return {
-                **state,
-                "patient_materials": {
-                    "simple_explanation": "Explicação simulada para o paciente.",
-                    "daily_guidelines": ["Repouso", "Hidratação"],
-                    "alert_signs": ["Febre alta", "Piora dos sintomas"],
-                    "faq": [{"question": "Quando devo retornar?", "answer": "Em 7 dias ou antes se piorar."}],
-                },
-            }
-        vertexai.init(project=os.environ.get("GCP_PROJECT", "deltarc"), location="us-central1")
-        model = GenerativeModel("gemini-1.5-pro")
         top = hypotheses[0]["condition"] if hypotheses else "condição avaliada"
+
         prompt = f"""Você é comunicador médico especialista em educação do paciente.
 
-Sobre: {top}. Plano: {json.dumps(care_plan, ensure_ascii=False)}
+Sobre: {top}. Plano: {json.dumps(care_plan, ensure_ascii=False)[:500]}
 
 Gere material educativo em linguagem simples para o paciente.
 Responda APENAS em JSON:
@@ -180,14 +284,34 @@ Responda APENAS em JSON:
   "alert_signs":["sinal"],
   "faq":[{{"question":"q","answer":"a"}}]
 }}"""
-        resp = model.generate_content(prompt)
-        try:
-            result = json.loads(resp.text.strip().replace("```json", "").replace("```", ""))
-        except Exception:
-            result = {"simple_explanation": resp.text, "daily_guidelines": [], "alert_signs": [], "faq": []}
-        return {**state, "patient_materials": result}
 
-    # ── Compilar o grafo ──
+        providers = []
+        if OPENAI_OK:
+            providers.append({"provider": "openai", "model": "gpt-4o", "temperature": 0.4})
+        if PERPLEXITY_KEY:
+            providers.append({"provider": "perplexity", "model": "sonar", "temperature": 0.4})
+        if DEEPSEEK_KEY:
+            providers.append({"provider": "deepseek", "model": "deepseek-chat", "temperature": 0.4})
+
+        raw = _chat_with_fallback(prompt, providers) if providers else ""
+        if raw:
+            try:
+                result = json.loads(raw.strip().replace("```json", "").replace("```", ""))
+                return {**state, "patient_materials": result}
+            except Exception:
+                pass
+
+        return {
+            **state,
+            "patient_materials": {
+                "simple_explanation": "Material educativo não disponível.",
+                "daily_guidelines": [],
+                "alert_signs": [],
+                "faq": [],
+            },
+        }
+
+    # ── Compile the graph ──
     def build_pipeline():
         g = StateGraph(DeltaScanState)
         g.add_node("transcription", agent_transcription)
@@ -214,10 +338,7 @@ else:
 app = FastAPI(title="DeltaScan", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ── Auth helpers ─────────────────────────────────────────────
-
-import secrets, hashlib, time
-
+# ── Auth helpers ──
 
 def make_token(doctor_id: str) -> str:
     payload = f"{doctor_id}:{time.time()}:{secrets.token_hex(16)}"
@@ -233,20 +354,18 @@ def verify_token(authorization: str = Header(default=None)) -> str:
             decoded = fb_auth.verify_id_token(token)
             return decoded["uid"]
         payload = base64.b64decode(token.encode()).decode()
-        doctor_id = payload.split(":")[0]
-        return doctor_id
+        return payload.split(":")[0]
     except Exception:
         raise HTTPException(status_code=401, detail="Token inválido")
 
 
-# ── Rotas ────────────────────────────────────────────────────
-
+# ── Routes ──
 
 @app.get("/health")
 async def health():
     return {
-        "status": "ok",
-        "service": "DeltaScan",
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
         "version": "2.0.0",
         "services": {
             "firestore": FIRESTORE_OK,
@@ -255,6 +374,9 @@ async def health():
             "firebase": FIREBASE_OK,
             "stripe": STRIPE_OK,
             "langgraph": LANGGRAPH_OK,
+            "deepseek": bool(DEEPSEEK_KEY),
+            "perplexity": bool(PERPLEXITY_KEY),
+            "grok": bool(XAI_KEY),
         },
     }
 
@@ -279,13 +401,8 @@ async def register(
         token = make_token(uid)
 
     doctor_data = {
-        "name": name,
-        "crm": crm,
-        "specialty": specialty,
-        "email": email,
-        "free_consultations_used": 0,
-        "subscription_active": False,
-        "plan": "free",
+        "name": name, "crm": crm, "specialty": specialty, "email": email,
+        "free_consultations_used": 0, "subscription_active": False, "plan": "free",
         "created_at": datetime.utcnow(),
     }
     if FIRESTORE_OK:
@@ -298,7 +415,6 @@ async def register(
 async def login(email: str = Form(...), password: str = Form(...)):
     if FIREBASE_OK and FIRESTORE_OK:
         import httpx
-
         api_key = os.environ.get("FIREBASE_API_KEY", "")
         async with httpx.AsyncClient() as client:
             r = await client.post(
@@ -316,17 +432,11 @@ async def login(email: str = Form(...), password: str = Form(...)):
     else:
         uid = hashlib.md5(email.encode()).hexdigest()
         token = make_token(uid)
-        doctor_data = {
-            "id": uid,
-            "name": "Dr. Demo",
-            "crm": "00000-SP",
-            "specialty": "Clínica Geral",
-            "email": email,
-            "free_consultations_used": 0,
-            "subscription_active": False,
-            "plan": "free",
+        return {
+            "token": token,
+            "doctor": {"id": uid, "name": "Dr. Demo", "crm": "00000-SP", "specialty": "Clínica Geral",
+                        "email": email, "free_consultations_used": 0, "subscription_active": False, "plan": "free"},
         }
-        return {"token": token, "doctor": doctor_data}
 
 
 @app.post("/api/auth/forgot-password")
@@ -345,12 +455,9 @@ async def process_consultation(
     doctor_specialty: str = Form(default="Clínica Geral"),
     doctor_notes: Optional[str] = Form(default=None),
     image: Optional[UploadFile] = File(default=None),
-    doctor_id: str = None,
+    doctor_id: str = "demo_doctor",
 ):
-    if not doctor_id:
-        doctor_id = "demo_doctor"
-
-    # Verificar limite gratuito
+    # Check free limit
     if FIRESTORE_OK:
         doc = DB.collection("doctors").document(doctor_id).get()
         if doc.exists:
@@ -367,43 +474,57 @@ async def process_consultation(
         result = await asyncio.to_thread(
             PIPELINE.invoke,
             {
-                "audio_bytes": audio_bytes,
-                "image_bytes": image_bytes,
-                "doctor_id": doctor_id,
-                "doctor_specialty": doctor_specialty,
-                "doctor_notes": doctor_notes,
-                "patient_id": None,
+                "audio_bytes": audio_bytes, "image_bytes": image_bytes,
+                "doctor_id": doctor_id, "doctor_specialty": doctor_specialty,
+                "doctor_notes": doctor_notes, "patient_id": None,
             },
         )
     else:
+        # Fallback without LangGraph — use direct multi-provider calls
+        transcription = doctor_notes or ""
+        if OPENAI_OK and audio_bytes:
+            import io
+            client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+            buf = io.BytesIO(audio_bytes)
+            buf.name = "audio.webm"
+            try:
+                resp = client.audio.transcriptions.create(model="whisper-1", file=buf, language="pt")
+                transcription = resp.text
+            except Exception as e:
+                print(f"[Whisper direct] Failed: {e}")
+
+        clinical_prompt = f"Analise clínica para {doctor_specialty}. Transcrição: {transcription}. Responda em JSON com hypotheses e care_plan."
+        providers = []
+        if OPENAI_OK:
+            providers.append({"provider": "openai", "model": "gpt-4o"})
+        if DEEPSEEK_KEY:
+            providers.append({"provider": "deepseek", "model": "deepseek-chat"})
+        if XAI_KEY:
+            providers.append({"provider": "grok", "model": "grok-2-latest"})
+
+        raw = _chat_with_fallback(clinical_prompt, providers) if providers else ""
+        try:
+            clinical = json.loads(raw.strip().replace("```json", "").replace("```", ""))
+        except Exception:
+            clinical = {"hypotheses": [{"rank": 1, "condition": "Demo", "reasoning": "Modo demo", "probability": "média"}],
+                        "care_plan": {"immediate_actions": [], "exams": [], "prescription": "", "follow_up": ""}}
+
         result = {
-            "transcription": "[Pipeline não disponível - modo demo]",
-            "hypotheses": [{"rank": 1, "condition": "Hipótese Demo", "reasoning": "Modo demonstração", "probability": "média"}],
-            "care_plan": {"immediate_actions": ["Demo"], "exams": [], "prescription": "Demo", "follow_up": "7 dias"},
+            "transcription": transcription,
+            "hypotheses": clinical.get("hypotheses", []),
+            "care_plan": clinical.get("care_plan", {}),
             "image_impression": None,
-            "patient_materials": {
-                "simple_explanation": "Explicação demo para o paciente.",
-                "daily_guidelines": ["Repouso", "Hidratação adequada"],
-                "alert_signs": ["Piora dos sintomas", "Febre alta"],
-                "faq": [{"question": "Quando devo retornar?", "answer": "Em 7 dias."}],
-            },
+            "patient_materials": {"simple_explanation": "Material demo.", "daily_guidelines": [], "alert_signs": [], "faq": []},
         }
 
     consultation_id = "demo_" + secrets.token_hex(8)
     if FIRESTORE_OK:
-        ref = DB.collection("consultations").add(
-            {
-                "doctor_id": doctor_id,
-                "doctor_specialty": doctor_specialty,
-                "doctor_notes": doctor_notes,
-                "transcription": result.get("transcription"),
-                "hypotheses": result.get("hypotheses"),
-                "care_plan": result.get("care_plan"),
-                "image_impression": result.get("image_impression"),
-                "patient_materials": result.get("patient_materials"),
-                "created_at": datetime.utcnow(),
-            }
-        )
+        ref = DB.collection("consultations").add({
+            "doctor_id": doctor_id, "doctor_specialty": doctor_specialty, "doctor_notes": doctor_notes,
+            "transcription": result.get("transcription"), "hypotheses": result.get("hypotheses"),
+            "care_plan": result.get("care_plan"), "image_impression": result.get("image_impression"),
+            "patient_materials": result.get("patient_materials"), "created_at": datetime.utcnow(),
+        })
         consultation_id = ref[1].id
         DB.collection("doctors").document(doctor_id).update({"free_consultations_used": firestore.Increment(1)})
 
@@ -414,7 +535,6 @@ async def process_consultation(
         "care_plan": result.get("care_plan"),
         "image_impression": result.get("image_impression"),
         "patient_materials": result.get("patient_materials"),
-        "free_consultations_remaining": None,
     }
 
 

@@ -14,6 +14,7 @@ import Onboarding from "@/pages/onboarding";
 import NewConsultation from "@/pages/new-consultation";
 import History from "@/pages/history";
 import Settings from "@/pages/settings";
+import Upgrade from "@/pages/upgrade";
 import NotFound from "@/pages/not-found";
 
 // Force dark mode globally
@@ -57,6 +58,7 @@ function AppShell() {
               <Route path="/dashboard" component={NewConsultation} />
               <Route path="/history" component={History} />
               <Route path="/settings" component={Settings} />
+              <Route path="/upgrade" component={Upgrade} />
               <Route component={NotFound} />
             </Switch>
           </main>
