@@ -490,46 +490,132 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       let patientMaterials: any = {};
       let imageImpression: string | null = null;
 
-      // ── Pipeline 1: Whisper STT ──────────────────────────────────
+      // ── Pipeline 1: Audio Transcription (Cloud Run primary → Vertex Health → Whisper) ─
       if (input.audioBase64) {
-        const whisperResult = await pipelineWhisperSTT(input.audioBase64);
-        transcription = whisperResult.text || input.doctorNotes || "";
-        pipelineLogs.push(whisperResult.log);
+        // Try Cloud Run /audio/transcribe first
+        let cloudRunTranscript = "";
+        try {
+          const audioRaw = input.audioBase64.includes(",") ? input.audioBase64.split(",")[1] : input.audioBase64;
+          const audioMime = input.audioBase64.startsWith("data:") ? input.audioBase64.split(";")[0].split(":")[1] : "audio/webm";
+          const ext = audioMime.split("/")[1]?.replace("mpeg", "mp3") || "webm";
+          const audioBuffer = Buffer.from(audioRaw, "base64");
+          const formData = new FormData();
+          const blob = new Blob([audioBuffer], { type: audioMime });
+          formData.append("file", blob, `audio.${ext}`);
+          formData.append("language", "pt-BR");
+          formData.append("specialty", input.doctorSpecialty || "general");
+          const crResp = await fetch(`${REAL_API}/audio/transcribe`, {
+            method: "POST",
+            body: formData,
+          });
+          if (crResp.ok) {
+            const crData = await crResp.json() as any;
+            cloudRunTranscript = crData.transcription || crData.text || "";
+            if (cloudRunTranscript) console.log("[Pipeline 1 - Cloud Run STT] OK: length =", cloudRunTranscript.length);
+          } else {
+            console.warn("[Pipeline 1 - Cloud Run STT] Failed:", crResp.status);
+          }
+        } catch (e: any) {
+          console.warn("[Pipeline 1 - Cloud Run STT] Error:", e.message);
+        }
+
+        if (cloudRunTranscript) {
+          transcription = cloudRunTranscript;
+          pipelineLogs.push({ step: "whisper_stt", provider: "openai", status: "success", durationMs: 0 });
+        } else {
+          // Fallback to local Vertex Health / Whisper
+          const whisperResult = await pipelineWhisperSTT(input.audioBase64);
+          transcription = whisperResult.text || input.doctorNotes || "";
+          pipelineLogs.push(whisperResult.log);
+        }
       } else {
         transcription = input.doctorNotes || "";
         pipelineLogs.push({ step: "whisper_stt", provider: "openai", status: "skipped", durationMs: 0 });
       }
 
-      // ── Pipeline 2: Clinical Analysis ────────────────────────────
+      // ── Pipeline 2: Clinical Analysis (Cloud Run /consultations/complete → local fallback) ─
       if (transcription || input.doctorNotes) {
-        const clinicalResult = await pipelineClinicalAnalysis(
-          transcription,
-          input.doctorSpecialty,
-          input.doctorNotes
-        );
-        hypotheses = clinicalResult.hypotheses;
-        carePlan = clinicalResult.carePlan;
-        pipelineLogs.push(clinicalResult.log);
+        // Try Cloud Run consultation_complete pipeline first
+        let cloudRunResult: any = null;
+        try {
+          const crResp = await fetch(`${REAL_API}/consultations/complete`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              transcription,
+              notes: input.doctorNotes || "",
+              specialty: input.doctorSpecialty,
+              language: "pt-BR",
+            }),
+          });
+          if (crResp.ok) {
+            cloudRunResult = await crResp.json();
+            console.log("[Pipeline 2 - Cloud Run Clinical] OK");
+          } else {
+            console.warn("[Pipeline 2 - Cloud Run Clinical] Failed:", crResp.status);
+          }
+        } catch (e: any) {
+          console.warn("[Pipeline 2 - Cloud Run Clinical] Error:", e.message);
+        }
 
-        // ── Pipeline 4: Patient Education ──────────────────────────
-        const topCondition = hypotheses[0]?.condition || "condição avaliada";
-        const educationResult = await pipelinePatientEducation(
-          topCondition,
-          input.doctorSpecialty,
-          carePlan
-        );
-        patientMaterials = educationResult.materials;
-        pipelineLogs.push(educationResult.log);
+        if (cloudRunResult?.hypotheses) {
+          hypotheses = cloudRunResult.hypotheses;
+          carePlan = cloudRunResult.care_plan || cloudRunResult.carePlan || {};
+          patientMaterials = cloudRunResult.patient_materials || {};
+          pipelineLogs.push({ step: "clinical_analysis", provider: "openai", status: "success", durationMs: 0 });
+          pipelineLogs.push({ step: "patient_education", provider: "openai", status: "success", durationMs: 0 });
+        } else {
+          // Fallback to local pipeline
+          const clinicalResult = await pipelineClinicalAnalysis(transcription, input.doctorSpecialty, input.doctorNotes);
+          hypotheses = clinicalResult.hypotheses;
+          carePlan = clinicalResult.carePlan;
+          pipelineLogs.push(clinicalResult.log);
+          const topCondition = hypotheses[0]?.condition || "condição avaliada";
+          const educationResult = await pipelinePatientEducation(topCondition, input.doctorSpecialty, carePlan);
+          patientMaterials = educationResult.materials;
+          pipelineLogs.push(educationResult.log);
+        }
       } else {
         pipelineLogs.push({ step: "clinical_analysis", provider: "openai", status: "skipped", durationMs: 0 });
         pipelineLogs.push({ step: "patient_education", provider: "openai", status: "skipped", durationMs: 0 });
       }
 
-      // ── Pipeline 3: Image Analysis ───────────────────────────────
+      // ── Pipeline 3: Image Analysis (Cloud Run /exams/analyze → Vertex Vision → GPT-4o) ─
       if (input.imageBase64) {
-        const imageResult = await pipelineImageAnalysis(input.imageBase64, input.doctorSpecialty);
-        imageImpression = imageResult.impression;
-        pipelineLogs.push(imageResult.log);
+        // Try Cloud Run /exams/analyze first
+        let cloudRunImpression = "";
+        try {
+          const imageRaw = input.imageBase64.includes(",") ? input.imageBase64.split(",")[1] : input.imageBase64;
+          const imageMime = input.imageBase64.startsWith("data:") ? input.imageBase64.split(";")[0].split(":")[1] : "image/jpeg";
+          const imageBuffer = Buffer.from(imageRaw, "base64");
+          const formData = new FormData();
+          const blob = new Blob([imageBuffer], { type: imageMime });
+          formData.append("file", blob, `image.${imageMime.split("/")[1] || "jpg"}`);
+          formData.append("specialty", input.doctorSpecialty || "general");
+          const crResp = await fetch(`${REAL_API}/exams/analyze`, {
+            method: "POST",
+            body: formData,
+          });
+          if (crResp.ok) {
+            const crData = await crResp.json() as any;
+            cloudRunImpression = crData.impression || crData.analysis || crData.report || "";
+            if (cloudRunImpression) console.log("[Pipeline 3 - Cloud Run Vision] OK");
+          } else {
+            console.warn("[Pipeline 3 - Cloud Run Vision] Failed:", crResp.status);
+          }
+        } catch (e: any) {
+          console.warn("[Pipeline 3 - Cloud Run Vision] Error:", e.message);
+        }
+
+        if (cloudRunImpression) {
+          imageImpression = cloudRunImpression;
+          pipelineLogs.push({ step: "image_analysis", provider: "openai", status: "success", durationMs: 0 });
+        } else {
+          // Fallback to local Vertex Vision / GPT-4o
+          const imageResult = await pipelineImageAnalysis(input.imageBase64, input.doctorSpecialty);
+          imageImpression = imageResult.impression;
+          pipelineLogs.push(imageResult.log);
+        }
       } else {
         pipelineLogs.push({ step: "image_analysis", provider: "openai", status: "skipped", durationMs: 0 });
       }
