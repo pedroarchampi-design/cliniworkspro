@@ -679,8 +679,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
               mode: "subscription",
               payment_method_types: ["card"],
               line_items: [{ price: priceId, quantity: 1 }],
-              success_url: `${req.headers.origin || "https://deltascan.app"}/settings?success=true&plan=${input.plan}`,
-              cancel_url: `${req.headers.origin || "https://deltascan.app"}/upgrade?canceled=true`,
+              success_url: `${req.headers.origin || "https://deltacan.app"}/settings?success=true&plan=${input.plan}`,
+              cancel_url: `${req.headers.origin || "https://deltacan.app"}/upgrade?canceled=true`,
               metadata: { doctorId: input.doctorId || "", plan: input.plan },
               allow_promotion_codes: true,
             });
@@ -696,7 +696,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         const checkoutResp = await fetch(`${REAL_API}/api/create-checkout-session`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${GOOGLE_TOKEN}` },
-          body: JSON.stringify({ user_id: input.doctorId, plan: input.plan, email: `${input.doctorId}@deltascan.app` }),
+          body: JSON.stringify({ user_id: input.doctorId, plan: input.plan, email: `${input.doctorId}@deltacan.app` }),
         });
         if (checkoutResp.ok) {
           const data = await checkoutResp.json() as any;

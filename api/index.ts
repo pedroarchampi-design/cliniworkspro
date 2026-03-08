@@ -9,11 +9,11 @@ import { registerRoutes } from "../server/routes";
 
 const app = express();
 
-// CORS for deltascan.app
+// CORS for deltacan.app
 app.use(cors({
   origin: [
-    "https://deltascan.app",
-    "https://www.deltascan.app",
+    "https://deltacan.app",
+    "https://www.deltacan.app",
     "https://deltacare.app",
     "http://localhost:5000",
     "http://localhost:3000",
