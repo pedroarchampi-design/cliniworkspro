@@ -1,0 +1,20 @@
+exam_type: transvaginal
+title: TRANSVAGINAL
+sections:
+  - name: TECNICA
+    text: "Texto conforme modelo Any Report."
+  - name: ANALISE
+    structures:
+      - name: estrutura_principal
+        normal_text: "Sem alterações significativas."
+        editable_blocks: true
+  - name: OPINIAO
+    conclusion_rules:
+      - "Gerada a partir de achados validados"
+required_fields:
+  - paciente
+  - medico
+output_order:
+  - TECNICA
+  - ANALISE
+  - OPINIAO
